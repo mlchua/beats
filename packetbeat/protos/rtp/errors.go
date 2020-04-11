@@ -1,4 +1,3 @@
-
 package rtp
 
 type rtpError struct {
@@ -13,6 +12,7 @@ func (e *rtpError) Error() string {
 }
 
 var (
-	headerTooShort = &rtpError{message: "Header length does not meet minimum length"}
-	unsupportedVersion = &rtpError{message: "Only RTP version 2 is supported"}
+	headerTooShort         = &rtpError{message: "Header length does not meet minimum length"}
+	extendedHeaderTooShort = &rtpError{message: "Extended header specified but no extended header found"}
+	unsupportedVersion     = &rtpError{message: "Only RTP version 2 is supported"}
 )
