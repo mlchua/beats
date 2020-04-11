@@ -2,18 +2,38 @@ package rtp
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/logp"
-
+	"github.com/elastic/beats/v7/packetbeat/pb"
 	"github.com/elastic/beats/v7/packetbeat/protos"
+)
+
+const (
+	MIN_HEADER_LENGTH          = 12
+	MIN_EXTENDED_HEADER_LENGTH = 4
+
+	// Masks for the first octet
+	VERSION_BITMASK    = 0b10000000
+	PADDING_BITMASK    = 0b00100000
+	EXTENSION_BITMASK  = 0b00010000
+	CSRC_COUNT_BITMASK = 0b00001111
+
+	// Masks for the second octet
+	MARKER_BITMASK  = 0b10000000
+	PAYLOAD_BITMASK = 0b01111111
 )
 
 // rtpPlugin application level protocol analyzer plugin
 type rtpPlugin struct {
-	ports protos.PortsConfig
-	log   *logp.Logger
+	ports  protos.PortsConfig
+	report protos.Reporter
+	log    *logp.Logger
+
+	includeExtensions bool
+	includePayload    bool
 }
 
 type rtpHeader struct {
@@ -67,7 +87,8 @@ func New(
 	cfg *common.Config,
 ) (protos.Plugin, error) {
 	p := &rtpPlugin{
-		log: logp.NewLogger("rtp"),
+		log:    logp.NewLogger("rtp"),
+		report: results,
 	}
 	config := defaultConfig
 	if !testMode {
@@ -89,6 +110,8 @@ func (rtp *rtpPlugin) init(results protos.Reporter, config *rtpConfig) error {
 
 func (rtp *rtpPlugin) setFromConfig(config *rtpConfig) error {
 	rtp.ports.Ports = config.Ports
+	rtp.includeExtensions = config.IncludeExtensions
+	rtp.includePayload = config.IncludePayload
 	return nil
 }
 
@@ -97,34 +120,22 @@ func (rtp *rtpPlugin) GetPorts() []int {
 }
 
 func (rtp *rtpPlugin) ParseUDP(pkt *protos.Packet) {
+	defer rtp.log.Recover("Parse rtp exception")
+
 	packetSize := len(pkt.Payload)
 
-	rtp.log.Infof("Parsing RTP packet addressed with %s of length %d.",
+	rtp.log.Debugf("Parsing RTP packet addressed with %s of length %d.",
 		pkt.Tuple.String(), packetSize)
 
-	_, err := rtp.parseRTPData(pkt.Payload)
+	parsedPkt, err := rtp.parseRTPData(pkt.Payload)
 	if err != nil {
 		// This means that the packet is either malformed or
-		// a non-RTP packet
+		// a non-RTP packet sent to an RTP port
 		rtp.log.Warnf("%s", err.Error())
 		return
 	}
+	rtp.publishPacket(parsedPkt, pkt)
 }
-
-const (
-	MIN_HEADER_LENGTH          = 12
-	MIN_EXTENDED_HEADER_LENGTH = 4
-
-	// Masks for the first octet
-	VERSION_BITMASK    = 0b10000000
-	PADDING_BITMASK    = 0b00100000
-	EXTENSION_BITMASK  = 0b00010000
-	CSRC_COUNT_BITMASK = 0b00001111
-
-	// Masks for the second octet
-	MARKER_BITMASK  = 0b10000000
-	PAYLOAD_BITMASK = 0b01111111
-)
 
 func (rtp *rtpPlugin) parseRTPData(rawData []byte) (*rtpPacket, error) {
 	header, remaining, err := rtp.parseRTPHeader(rawData)
@@ -212,4 +223,55 @@ func (rtp *rtpPlugin) parseRTPExtendedHeader(rawData []byte) (*rtpExtendedHeader
 		extension: extension,
 	}
 	return extendedHeader, rawData[stopOffset:], nil
+}
+
+func (rtp *rtpPlugin) publishPacket(pkt *rtpPacket, orig *protos.Packet) {
+	evt, pbf := pb.NewBeatEvent(orig.Ts)
+
+	// source/destination (note: this protocol does not produce a bi-flow.)
+	src, dst := common.MakeEndpointPair(orig.Tuple.BaseTuple, nil)
+	pbf.SetSource(&src)
+	pbf.SetDestination(&dst)
+	pbf.Source.Bytes = int64(len(orig.Payload))
+
+	pbf.Event.Start = orig.Ts
+	pbf.Event.Dataset = "rtp"
+	pbf.Network.Transport = "udp"
+	pbf.Network.Protocol = pbf.Event.Dataset
+
+	fields := evt.Fields
+	fields["type"] = pbf.Event.Dataset
+	fields["status"] = common.OK_STATUS
+
+	header := common.MapStr{
+		"version":         pkt.header.version,
+		"padding":         pkt.header.hasPadding,
+		"extension":       pkt.header.hasExtension,
+		"csrc_count":      pkt.header.csrcCount,
+		"marker":          pkt.header.hasMarker,
+		"payload_type":    pkt.header.payloadType,
+		"sequence_number": pkt.header.sequenceNumber,
+		"timestamp":       pkt.header.timestamp,
+		"ssrc":            pkt.header.ssrc,
+		"csrc_list":       pkt.header.csrc,
+	}
+
+	rtpFields := common.MapStr{}
+	rtpFields.Put("header", header)
+
+	if rtp.includeExtensions && pkt.header.hasExtension {
+		extendedHeader := common.MapStr{
+			"profile":   pkt.extendedHeader.profile,
+			"length":    pkt.extendedHeader.length,
+			"extension": hex.EncodeToString(pkt.extendedHeader.extension),
+		}
+		rtpFields.Put("extensionHeader", extendedHeader)
+	}
+	if rtp.includePayload {
+		rtpFields.Put("payload", hex.EncodeToString(pkt.payload))
+	}
+
+	fields.Put("rtp", rtpFields)
+
+	rtp.report(evt)
 }
